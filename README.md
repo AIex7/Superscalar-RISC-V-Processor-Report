@@ -1,188 +1,132 @@
-# Apex-RV: Out-of-Order Superscalar RISC-V Processor
+# Apex-RV: Out-of-order RISC-V processor
 
 [![Language](https://img.shields.io/badge/Language-SystemVerilog-blue.svg)](https://en.wikipedia.org/wiki/SystemVerilog)
 [![ISA](https://img.shields.io/badge/ISA-RISC--V%20(RV32IMC)-orange.svg)](https://riscv.org/)
-[![Target](https://img.shields.io/badge/Target-FPGA%20Synthesis-green.svg)](#fpga-synthesis--physical-design)
-[![Timing](https://img.shields.io/badge/Clock-100%20MHz%20(Slack%20%2B1.238ns)-brightgreen.svg)](#timing--slack-closure)
+[![Target](https://img.shields.io/badge/Target-FPGA%20Synthesis-green.svg)](#fpga-synthesis-and-timing)
+[![Timing](https://img.shields.io/badge/Clock-100%20MHz%20(Slack%20%2B1.238ns)-brightgreen.svg)](#timing-report)
 [![Architecture](https://img.shields.io/badge/Microarch-Tomasulo%20%2B%20ROB%20%2B%20RAT-purple.svg)](#microarchitecture-overview)
 
-Apex-RV is a synthesizable, high-performance, 32-bit out-of-order (OoO) speculative RISC-V processor core designed and implemented from scratch in SystemVerilog for FPGA deployment. 
+Apex-RV is a 32-bit out-of-order RISC-V processor core written in SystemVerilog for an FPGA. Our team built it around Tomasulo's algorithm with a reorder buffer (ROB) for in-order commit, register renaming through an alias table (RAT), and a multi-channel common data bus (CDB).
 
-Developed as a collaborative team engineering project, the processor implements an out-of-order execution engine based on **Tomasulo's Algorithm** with dynamic register renaming via a **Register Alias Table (RAT)**, in-order retirement via a **Reorder Buffer (ROB)**, a multi-entry **Common Data Bus (CDB)**, a hybrid **Tournament Branch Predictor**, an **L1 Next-Line Instruction Cache Prefetcher**, a **Split Load-Store Queue (Split LSQ)**, and a **Post-Commit Store Buffer** with store-to-load forwarding.
+On top of the base out-of-order pipeline, we added a tournament branch predictor (GSelect plus a two-level adaptive predictor), an L1 instruction prefetcher, a post-commit store buffer with store-to-load forwarding, and split queues for memory operations. Across benchmarks (`coremark`, `aes_sha`, `compression`, `fft`, and `mergesort`), these changes roughly doubled our IPC compared to our early pipeline, while hitting 100 MHz with 1.238 ns of positive slack.
 
-Across standard industry and systems benchmarks (`coremark`, `aes_sha`, `compression`, `fft`, `mergesort`), our microarchitectural optimizations achieved a **>2x IPC uplift** (up to **+162.5%** on memory/branch-heavy workloads) while meeting all timing constraints at **100 MHz** with **+1.238 ns** positive slack on the FPGA target.
+## Architecture summary
 
----
+- Out-of-order execution with Tomasulo's algorithm, using a reorder buffer (ROB) for precise state and in-order retirement.
+- Register renaming with an architectural register file (ARF) and register alias table (RAT), removing WAR and WAW register hazards.
+- Common data bus broadcasting tags and values to reservation stations and the ROB on the same cycle execution completes.
+- Dual-stage decode, including an early decode block that pulls branch targets directly from the line buffer to keep the branch predictor ahead of the pipeline.
+- Tournament branch predictor using a 4-bit chooser between GSelect and two-level adaptive prediction, cutting branch flushes by 51.4% on CoreMark.
+- L1 cache system with a next-line prefetcher on instruction fetch and a burst memory adapter (`bmem_*`) that converts 64-bit DRAM beats into 256-bit cache lines.
+- Split load-store queue (LSQ) separating load and store stations to prevent false ordering stalls.
+- Post-commit store buffer with address coalescing and direct store-to-load forwarding.
+- Synthesized for FPGA at 100 MHz with 1.238 ns slack, achieved by restructuring reservation station arbitration into a queue rather than full matrix comparisons.
 
-## Key Architectural Highlights
+## Microarchitecture overview
 
-- **Dynamic Speculative Out-of-Order Execution**:
-  - Reorder Buffer (ROB) supporting precise exceptions and in-order retirement.
-  - Dual Register File scheme: Architectural Register File (ARF) and speculative Register Alias Table (RAT) for zero-stall register renaming (eliminating WAR and WAW hazards).
-  - Multi-station Common Data Bus (CDB) broadcasting tag/data pairs directly to waiting reservation stations and the ROB.
-- **Advanced Branch Handling**:
-  - Early branch decode stage operating directly off the instruction line buffer.
-  - Hybrid Tournament Predictor coupling a global-history **GSelect** predictor and a local **Two-Level Adaptive** predictor managed by a 4-bit saturating counter meta-predictor.
-  - Slashes branch misprediction flushes by **>51.4%**.
-- **High-Throughput Memory Subsystem**:
-  - Split L1 Caches: Non-blocking L1 Instruction Cache with hardware next-line prefetcher and L1 Data Cache.
-  - Burst Memory Interface adapter (`bmem_*`) bridging multi-word DRAM bursts to single-cycle cache lines.
-  - Dedicated circular **Post-Commit Store Buffer** with address merging and instantaneous store-to-load forwarding.
-  - **Split LSQ** with separate Load and Store queues for age-prioritized memory disambiguation.
-- **FPGA Timing Optimized**:
-  - 100 MHz target operating frequency cleanly closed with **1.24 ns** slack.
-  - Optimized age-priority queue issue logic to truncate critical combinational paths.
-  - Decoupled reservation station dispatch from functional unit execution to maximize IPC.
+### Pipeline structure
 
----
-
-## Microarchitecture Overview
-
-### Top-Level Pipeline Architecture
-
-The complete processor datapath and control structure is organized into decoupled pipeline stages connected via latency-insensitive handshakes and FIFO queues.
+We broke the pipeline into decoupled stages connected with valid-ready handshakes and FIFO queues so back-end stalls do not immediately back up fetch.
 
 ![Pipeline Architecture](docs/images/pipeline_architecture.png)
 
-1. **Memory Interface**:
-   - Connects to the system memory via a 64-bit/burst DRAM interface (`bmem_*`).
-   - A hardware `cache_line_adapter` serializes/deserializes burst data packets to serve 256-bit cache lines to the L1 caches.
-2. **Caches**:
-   - **Instruction Cache**: Directly interfaces with the speculative next-line prefetcher to keep the pipeline fed.
-   - **Data Cache**: Interfaces with the memory execution unit and the post-commit store buffer.
-3. **Fetch & Buffer**:
-   - `inst_line_buffer` caches incoming cache lines.
-   - Pushes 32-bit instructions into a parameterized `instruction_queue` FIFO to decouple front-end fetch latency from decode.
-4. **Dual-Stage Decode**:
-   - **Early Decode Stage (`decode_stage_early`)**: Sits immediately behind the line buffer to extract branch target offsets and opcode hints early, driving the `tournament_predictor` without stalling.
-   - **Standard Decode Stage (`decode_stage`)**: Pulls instructions from the queue, decodes registers, control words, and immediate fields, and feeds the dispatch logic.
-5. **Predict & Dispatch (`dispatch_issue`)**:
-   - Queries the RAT to obtain physical operand tags or current ARF values.
-   - Allocates the next sequential entry in the ROB.
-   - Dispatches instructions and operands/tags to the appropriate reservation station.
-6. **Out-of-Order Execution**:
-   - Multiple specialized functional units operating concurrently:
-     - `alu_unit`: Single-cycle integer arithmetic, logic, and shifts.
-     - `mul_unit`: Hardware multiplier pipeline.
-     - `br_unit`: Branch condition verification and target address validation.
-     - `mem_unit`: Effective address calculation and load/store queue interface.
-7. **Common Data Bus & In-Order Commit**:
-   - Completed functional units arbitrate for the `cdb` (Common Data Bus).
-   - Results broadcast tag/value pairs to all listening reservation stations and the `rob_inst` (Reorder Buffer).
-   - The ROB retires instructions strictly in program order, committing values to the `rat_arf` (ARF/RAT) and releasing store buffer entries to memory.
+1. Memory interface: Connects to 64-bit burst DRAM over `bmem_*` signals. A `cache_line_adapter` serializes and deserializes data between the memory bus and the 256-bit cache lines.
+2. Caches: A dedicated instruction cache feeds from the prefetcher, while the data cache connects to the memory execution unit and the store buffer.
+3. Fetch and line buffer: `inst_line_buffer` holds raw data coming from the instruction cache. Instructions flow into a parameterized `instruction_queue` FIFO, isolating fetch from decode stalls.
+4. Dual decode paths: Standard decode (`decode_stage`) unpacks instructions from the queue, resolving register indices and immediate formats for dispatch. An early decode block (`decode_stage_early`) sits directly on the line buffer, pulling branch targets and opcode fields a cycle earlier so the tournament predictor does not lag behind fetch.
+5. Predict and dispatch: Checks the RAT for each source register to grab either the committed ARF data or an in-flight ROB tag. It allocates the next slot in the ROB and pushes the instruction into the target reservation station.
+6. Execution units: Four independent functional units run in parallel:
+   - `alu_unit`: Single-cycle integer arithmetic, logic, and shifts.
+   - `mul_unit`: Multi-cycle hardware multiplier.
+   - `br_unit`: Branch condition evaluation and target address check.
+   - `mem_unit`: Address generation and interface to load-store buffers.
+7. Writeback and commit: When a functional unit finishes, it requests the common data bus (`cdb`). The bus broadcasts tag-data pairs to waiting reservation stations and the reorder buffer (`rob_inst`). The ROB retires instructions strictly in program order, writes results to the register file (`rat_arf`), and drains committed writes from the store buffer.
 
----
+### Tomasulo execution engine
 
-### Tomasulo Execution Engine
-
-The core execution mechanics were originally modeled and iteratively refined from the classic Tomasulo algorithm with speculative Reorder Buffer extensions:
+Our initial floorplan followed Tomasulo's algorithm with a speculative reorder buffer:
 
 ![Tomasulo Microarchitecture Plan](docs/images/tomasulo_diagram.png)
 
-- **Register Renaming**: Read operands check the RAT. If an in-flight instruction produces the register, the RAT returns the corresponding ROB tag; otherwise, it returns the committed ARF value.
-- **Snooping & Forwarding**: When a functional unit outputs a tag match on the CDB, reservation stations latch the value into their pending operand slots in the same cycle.
-- **Decoupled Dispatch**: Instructions dispatch into available reservation station entries even if functional units are currently busy executing previous instructions, preventing front-end stalls.
+When an instruction dispatches, its source registers look up the RAT. If an older in-flight instruction produces that register, the RAT supplies the ROB tag; otherwise, the instruction takes the value from the ARF. Once operands are ready, the station issues to its functional unit. If operands are still pending, the station snoops the CDB and grabs incoming values the moment their tag appears.
 
----
+We also separated dispatch from functional unit availability. Instructions can dispatch into an open reservation station even when the execution unit is busy with earlier work.
 
-## Advanced Features & Optimizations
+## Optimizations and tuning
 
-### 1. Tournament Branch Predictor (GSelect + Two-Level)
+### Tournament branch predictor (GSelect and two-level)
 
-Branch mispredictions are extraordinarily expensive in an out-of-order processor due to the penalty of flushing the ROB, RAT, reservation stations, and fetch buffers. To maximize prediction accuracy, we built a hybrid **Tournament Predictor**:
+Flushing the ROB, RAT, reservation stations, and instruction buffers on a mispredicted branch is expensive. We tested static not-taken early on and saw too many flushes, so we built a hybrid tournament predictor:
 
-- **GSelect Predictor**: Correlates global branch history (PHT index derived from hashing branch PC bits with the global branch history register). Ideal for patterned sequences and nested control flows.
-- **Two-Level Adaptive Predictor**: Utilizes local branch history tables (BHT) indexed by PC, referencing per-branch pattern history tables. Ideal for independent, loop-bound branches.
-- **Chooser Meta-Predictor**: A 4-bit saturating counter array indexed by the branch address decides whether to use GSelect or Two-Level. When predictions disagree, the counter increments toward the winning predictor or decrements toward the other.
+- GSelect predictor: Hashes the global branch history register with PC bits to index a pattern history table, which catches correlated branches in loops and control flow.
+- Two-level adaptive predictor: Uses local per-branch history tables, which works better for independent loop exits.
+- Chooser: A table of 4-bit saturating counters indexed by branch PC. If the two predictors give different predictions, the counter increments toward the correct one and decrements away from the wrong one.
 
 ![Branch Predictor Performance](docs/images/branch_predictor_stats.png)
 
-#### Real Hardware Impact (Measured on `coremark_im`):
-| Branch Predictor Scheme | Total Branches Encountered | Pipeline Misprediction Flushes | Core IPC |
+Measurements on `coremark_im`:
+
+| Predictor | Branches | Flushes | IPC |
 | :--- | :---: | :---: | :---: |
-| **Static Not-Taken** | 111,945 | 34,821 | 0.335 |
-| **Tournament Predictor** | 75,303 | **16,899** | **0.413** |
-| **Net Improvement** | — | **-51.4% Flushes** | **+23.3% IPC** |
+| Static not-taken | 111,945 | 34,821 | 0.335 |
+| Tournament | 75,303 | 16,899 | 0.413 |
 
----
+The tournament predictor cut misprediction flushes by 51.4% and raised CoreMark IPC by 23.3%.
 
-### 2. Next-Line Instruction Cache Prefetcher
+### Next-line instruction cache prefetcher
 
-Front-end starvation was one of our primary initial bottlenecks—small reservation station depths meant instructions had to arrive rapidly to keep execution units saturated.
-
-We designed a dedicated **Next-Line Prefetcher** module interfacing directly between the L1 instruction cache and the memory line adapter. Whenever cache line $N$ is requested, the prefetcher speculatively requests line $N+1$ into the line buffer during available bus cycles.
+In our early tests, reservation stations emptied frequently because the front end could not deliver instructions quickly enough after a miss. We added a next-line prefetcher between the L1 instruction cache and the cache line adapter. When cache line $N$ is requested, the prefetcher checks for line $N+1$ and fetches it during idle bus cycles before the core requests it.
 
 ![Prefetcher Performance](docs/images/prefetcher_stats.png)
 
-#### Prefetcher Verification on `coremark_im`:
-| Metric | Without Prefetcher | With Prefetcher | Impact |
+Measurements on `coremark_im`:
+
+| Configuration | Compare state cycles | Compare state hits | Hit rate |
 | :--- | :---: | :---: | :---: |
-| **Cycles in Compare State** | 102,586 | 203,157 | +98.0% |
-| **Hits in Compare State** | 99,493 | 199,869 | +100.9% |
-| **L1 Instruction Cache Hit Rate** | **96.9%** | **98.3%** | **+1.4% Hit Rate (Near-Zero Stall)** |
+| Without prefetcher | 102,586 | 99,493 | 96.9% |
+| With prefetcher | 203,157 | 199,869 | 98.3% |
 
----
+Prefetching increased cache hits in the compare state and brought overall instruction cache hit rate to 98.3%, keeping the instruction queue populated.
 
-### 3. Post-Commit Store Buffer & Store-to-Load Forwarding
+### Post-commit store buffer and forwarding
 
-In an out-of-order processor, memory stores cannot write to the cache or DRAM speculatively—they must wait until commit to preserve precise architectural state. However, stalling the ROB until a store finishes a multi-cycle DRAM write destroys performance.
+Stores cannot write to cache or memory speculatively. If stores stayed in the ROB until DRAM acknowledged the write, the commit head would stall for several cycles on every store instruction.
 
-We implemented a **Post-Commit Store Buffer**:
-- Formed as an asynchronous circular ring buffer.
-- Stores retire from the ROB into the Store Buffer immediately, freeing the ROB entry for younger instructions.
-- **Store-to-Load Forwarding**: When an in-flight load executes, it snoops the Store Buffer in parallel with the L1 cache. If an unwritten store matches the load address, data is forwarded directly with zero memory stall cycles.
-- **Address Merging**: Consecutive stores writing to the same cache block merge into a single transaction, minimizing memory bus contention.
+We added an asynchronous circular store buffer past the commit stage:
+- Stores retire from the ROB as soon as they reach the head of the buffer, freeing the ROB entry for younger instructions.
+- When younger loads calculate their address, they snoop the store buffer while checking the L1 data cache. If an unwritten store has the same address, the store buffer forwards the data directly to the load without waiting for cache writes.
+- Consecutive stores to the same cache block merge into one transaction, cutting down memory bus traffic.
 
----
+### Split load-store queue
 
-### 4. Split Load-Store Queue (Split LSQ)
+Instead of a single queue for all memory operations, we split load and store reservation stations into separate queues. Loads do not get held up behind unrelated pending stores, and checking address dependencies is simpler. When a load is ready to issue, the logic only checks whether an older store in program order has an overlapping or unresolved address.
 
-Rather than maintaining a monolithic, complex associative LSQ, we split memory operations into separate **Load Reservation Stations** and **Store Reservation Stations**:
-- Eliminates head-of-line blocking where pending stores would unnecessarily stall independent loads.
-- Enforces memory disambiguation by tracking program order: loads only execute when all older stores with matching or unknown addresses have resolved their effective addresses.
-- Significantly simplifies issue logic and cuts arbitration delay by half.
+### Age-ordered issue scheduling
 
----
+Our first scheduler compared the arrival time of every reservation station against every other station to find the oldest ready instruction. That comparison matrix created a wide combinational delay path and limited our clock speed.
 
-### 5. Age-Ordered Issue Scheduling
+We replaced the full matrix with a queue-like priority chain. The head pointer tracks the most likely oldest station. If that station is blocked on an unresolved operand, the issue logic ripples down to the next ready station. This eliminated the deep comparator tree on our dispatch path and let us close timing at 100 MHz.
 
-In our baseline design, issuing the oldest ready instruction required an $O(N^2)$ all-to-all age matrix comparison across every active reservation station. This dominated our critical path and capped our clock speed.
+### Compressed instruction extension (RV32C)
 
-To close timing:
-- We overhauled the scheduling logic into an **Age-Ordered Queue Structure**.
-- The head of each reservation station group tracks the most likely oldest ready station.
-- If the oldest station is waiting on an operand, the arbiter ripples down to the next ready station in the queue.
-- This eliminated dozens of levels of combinational logic from the dispatch clock path while maintaining high IPC.
+We built an experimental decoder for 16-bit compressed instructions. It runs parallel to the main 32-bit decoder and expands 16-bit instructions into internal RV32I equivalents in one cycle. We kept this implementation on a separate branch because the extra multiplexing and decode logic added significant FPGA area when combined with the rest of the out-of-order engine.
 
----
+## Benchmark results
 
-### 6. RISC-V Compressed Instruction Extension (RV32C)
+We tested the processor on five programs: `coremark`, `aes_sha`, `compression`, `fft`, and `mergesort`. We added hardware performance counters to the commit and cache stages to record cycles, instructions retired, cache hits, and flushes.
 
-To enhance code density and maximize instruction fetch bandwidth through our cache lines, we developed support for the RISC-V 'C' extension:
-- Implemented a **secondary parallel decode module** operating side-by-side with the standard 32-bit decoder.
-- Expands 16-bit compressed instructions into internal 32-bit canonical RV32I micro-ops in single-cycle combinational logic.
-- Maintained on a dedicated synthesis branch to evaluate area vs. density trade-offs on FPGA slices.
+### Baseline vs. final performance
 
----
-
-## Benchmark Results & Performance Evaluation
-
-We verified and profiled the processor across five standard benchmarks: `coremark`, `aes_sha`, `compression`, `fft`, and `mergesort`. Performance counters were integrated directly into the datapath to collect exact cycle counts, instruction retirements, cache hits, and pipeline flushes.
-
-### Full Benchmark Suite Comparison
-
-Comparing our initial baseline out-of-order processor against our final optimized architecture:
-
-| Benchmark | Baseline IPC | Final Optimized IPC | IPC Uplift (%) | Baseline Delay (ps) | Final $DP^2$ |
+| Benchmark | Baseline IPC | Final IPC | Change | Baseline delay (ps) | Final $DP^2$ |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **`coremark`** | 0.2102 | **0.4131** | <span style="color:green">**+96.5%**</span> | 13,870,820,000 | 37,283.25 |
-| **`aes_sha`** | 0.1923 | **0.4077** | <span style="color:green">**+112.0%**</span> | 40,345,330,000 | 1,953,559.83 |
-| **`compression`** | 0.2163 | **0.5678** | <span style="color:green">**+162.5%**</span> | 22,273,410,000 | 49,858.68 |
-| **`fft`** | 0.1922 | **0.4251** | <span style="color:green">**+121.2%**</span> | 60,419,880,000 | 8,243,623.53 |
-| **`mergesort`** | 0.2284 | **0.4221** | <span style="color:green">**+84.8%**</span> | 18,388,980,000 | 256,849.65 |
+| `coremark` | 0.2102 | 0.4131 | +96.5% | 13,870,820,000 | 37,283.25 |
+| `aes_sha` | 0.1923 | 0.4077 | +112.0% | 40,345,330,000 | 1,953,559.83 |
+| `compression` | 0.2163 | 0.5678 | +162.5% | 22,273,410,000 | 49,858.68 |
+| `fft` | 0.1922 | 0.4251 | +121.2% | 60,419,880,000 | 8,243,623.53 |
+| `mergesort` | 0.2284 | 0.4221 | +84.8% | 18,388,980,000 | 256,849.65 |
 
 ```
-Benchmark IPC Comparison (Baseline vs Final)
+Benchmark IPC comparison (baseline vs final)
 ========================================================================
 coremark     [██████████ 0.210]  --->  [████████████████████ 0.413]   (+96.5%)
 aes_sha      [█████████ 0.192]   --->  [████████████████████ 0.408]   (+112.0%)
@@ -192,115 +136,94 @@ mergesort    [███████████ 0.228] --->  [██████
 ========================================================================
 ```
 
-### Key Takeaways:
-1. **Dramatic IPC Doubling**: Across all workloads, IPC increased by **+84.8% to +162.5%**.
-2. **Compression Benchmark Spike (0.5678 IPC)**: The compression workload benefited enormously from the combination of the Next-Line Prefetcher and the Post-Commit Store Buffer due to its high frequency of sequential memory accesses and pointer chasing.
-3. **Low Delay-Product-Squared ($DP^2$)**: Demonstrates that high instruction throughput was achieved without ballooning energy-delay metrics.
+The compression benchmark saw the largest gain (+162.5%) because its tight loop has sequential memory accesses that the next-line prefetcher and store buffer handled cleanly without stalling the ROB. On `aes_sha` and `fft`, the tournament predictor was the main contributor, cutting branch resolution latency on long inner loops.
 
----
+## FPGA synthesis and timing
 
-## FPGA Synthesis & Physical Design
-
-### Timing & Slack Closure
-
-Synthesis and timing closure were conducted with tight design constraints at a target frequency of **100 MHz** (10.0 ns cycle period).
+We targeted a 100 MHz clock (10.0 ns period) for FPGA synthesis.
 
 ```text
 ================================================================================
-Design Timing Report (Target: 100 MHz)
+Timing report (Target: 100 MHz)
 ================================================================================
 Clock period:              10.000000 ns
 Data required time:         9.958930 ns
 Data arrival time:         -8.720723 ns
 --------------------------------------------------------------------------------
 Slack (MET):               +1.238207 ns
-Status:                    TIMING MET (Clean Positive Slack)
 ================================================================================
 ```
 
-### Cell Area Breakdown
-
-Our goal throughout development was to maximize microarchitectural performance while strictly policing hardware resource utilization and FPGA gate counts.
+### Area breakdown
 
 ```text
 ================================================================================
-Area Synthesis Report
+Area report
 ================================================================================
-Combinational Area:                 71,657.47  units
-Non-combinational Area:             60,164.14  units
-Macro / Black Box Area:             79,531.08  units
-Buffer / Inverter Area:              5,322.66  units
+Combinational area:                 71,657.47  units
+Non-combinational area:             60,164.14  units
+Macro / black box area:             79,531.08  units
+Buffer / inverter area:              5,322.66  units
 --------------------------------------------------------------------------------
-Total Cell Area:                   211,352.70  units
+Total cell area:                   211,352.70  units
 ================================================================================
 ```
 
----
+## Practical issues and bug fixes
 
-## Engineering Challenges & Design Iterations
+### Reservation station depth
 
-Building an out-of-order core involves intricate race conditions and corner cases. Below are some of the critical engineering hurdles we encountered and resolved during development:
+Area limits on the FPGA forced us to cut reservation station depth from 8 entries down to 4 entries for every functional unit except the ALU. We expected IPC to drop as a result, but it actually improved. With 8 entries, our queue-based arbiter took longer to find the true oldest instruction when entries in between were stalled on operands. With 4 entries, the queue had less internal fragmentation, ready instructions dispatched sooner, and we saved considerable logic area.
 
-### 1. The "Reservation Station Depth" Paradox
-- **Issue**: Due to FPGA slice area limitations, we had to reduce non-ALU reservation station depths from **8 entries down to 4 entries** (leaving the ALU station depth larger).
-- **Surprising Outcome**: Counterintuitively, reducing depth **increased overall IPC**! 
-- **Root Cause**: In our priority issue scheme, smaller queues reduced arbitration tree latency and increased the probability of dispatching the actual oldest ready instructions sooner, avoiding queue stall bubbles.
+### Removing execution unit stalls
 
-### 2. Eliminating Artificial Pipeline Stalls
-- **Issue**: In our early prototypes, we introduced a conservative stall every other cycle to prevent multi-cycle functional units (like multipliers and memory loads) from being preempted.
-- **Fix**: We rebuilt the functional unit issue logic with explicit valid/ready latency-insensitive handshakes, completely removing the artificial stall cycles and doubling instruction throughput.
+Early in development, we added an artificial stall every other cycle to keep multi-cycle units (like the multiplier and memory stage) from getting preempted mid-execution. It prevented race conditions, but it cut our maximum throughput in half. Once we rewrote the issue stage to use explicit valid-ready handshakes for each functional unit, we removed the stall cycle entirely and let instructions issue on consecutive cycles whenever units were free.
 
-### 3. Pipelining Combinational Logic in Clocked Blocks
-- **Issue**: Early timing analysis revealed severe negative slack caused by massive combinational decoding trees nested directly within `always_ff` blocks.
-- **Fix**: We refactored the front-end into distinct pipeline registers, isolating immediate decoding, control signal generation, and branch offset calculation into dedicated early decode stages.
+### Moving combinational logic out of clocked blocks
 
-### 4. Memory Bus Handshake Deadlocks
-- **Issue**: An early bug caused the burst memory read request signal (`bmem_read`) to remain asserted across multiple consecutive cycles after DRAM grant, causing spurious reads and memory corruptions.
-- **Fix**: Added a stateful edge-triggered handshake flag in the cache line adapter to enforce single-pulse assertion per cache miss.
+Our first synthesis runs failed timing badly because we had placed wide immediate-generation and control-decode logic inside clocked `always_ff` blocks. That created long propagation delays before the flip-flop setup times. We pulled those decoding paths out into dedicated combinational early-decode stages with their own pipeline registers, which fixed the negative slack.
 
----
+### Memory bus handshake bug
 
-## Repository Structure
+During burst reads, `bmem_read` stayed asserted for multiple cycles after memory granted access. The DRAM controller interpreted each cycle as a new read request, corrupting cache fills. We added an edge-triggered handshake flag in the cache line adapter so that each cache miss triggers exactly one pulse on `bmem_read`.
+
+## Repository structure
 
 ```text
 .
 ├── docs/
 │   └── images/
-│       ├── pipeline_architecture.png     # Full datapath & pipeline block diagram
-│       ├── tomasulo_diagram.png          # Tomasulo execution engine microarchitecture
-│       ├── branch_predictor_stats.png    # Branch predictor hardware comparison
-│       └── prefetcher_stats.png          # L1 cache prefetcher hit rate statistics
+│       ├── pipeline_architecture.png     # Pipeline block diagram
+│       ├── tomasulo_diagram.png          # Planned Tomasulo floorplan
+│       ├── branch_predictor_stats.png    # Branch predictor comparison
+│       └── prefetcher_stats.png          # Instruction prefetcher hit rates
 ├── hdl/
-│   ├── cpu.sv                            # Top-level CPU core integration
+│   ├── cpu.sv                            # Top-level CPU core
 │   ├── datapath/
-│   │   ├── fetch/                        # Instruction fetch, line buffer, queue
-│   │   ├── decode/                       # Dual decode stages (standard + early)
+│   │   ├── fetch/                        # Fetch, line buffer, instruction queue
+│   │   ├── decode/                       # Standard and early decode stages
 │   │   ├── dispatch/                     # RAT, reservation station allocation
 │   │   ├── execute/                      # ALU, multiplier, branch, memory units
-│   │   └── commit/                       # Reorder Buffer (ROB), ARF, CDB logic
+│   │   └── commit/                       # Reorder buffer, ARF, CDB logic
 │   ├── branch_prediction/
-│   │   ├── tournament_predictor.sv       # Hybrid chooser meta-predictor
+│   │   ├── tournament_predictor.sv       # Chooser table and top-level predictor
 │   │   ├── gselect.sv                    # Global history predictor
 │   │   └── two_level.sv                  # Local two-level adaptive predictor
 │   └── memory/
 │       ├── cache_line_adapter.sv         # DRAM burst deserializer
-│       ├── prefetcher.sv                 # Next-line L1 instruction prefetcher
+│       ├── prefetcher.sv                 # Next-line instruction prefetcher
 │       ├── l1_icache.sv                  # L1 instruction cache
 │       ├── l1_dcache.sv                  # L1 data cache
 │       └── store_buffer.sv               # Post-commit ring buffer with forwarding
 ├── sim/                                  # Testbenches and verification harness
-└── synth/                                # Synthesis scripts, constraints & reports
+└── synth/                                # Synthesis scripts, constraints, and reports
 ```
 
----
+## Team and workflow
 
-## Team & Workflow
+Our team split responsibilities across the core modules:
+- Alex: Instruction queue, cache line adapter, memory subsystem, and system verification.
+- Erin: Datapath planning, fetch stage, and architecture diagrams.
+- Sujin: Early decode block, instruction fetch buffers, and hardware testbenches.
 
-This processor was collaboratively designed, implemented, and verified by our engineering team:
-- **Alex**: Parameterizable FIFO queues, DRAM cache line adapter, memory subsystem, and system verification.
-- **Erin**: Pipeline datapath microarchitecture, instruction fetch pipeline, and architectural diagrams.
-- **Sujin**: Datapath integration, early decode logic, instruction fetch buffers, and hardware verification.
-
-### Collaborative Engineering Practices:
-- **Pair Programming via VSCode Live Share**: Used live collaborative sessions to trace complex CDB arbitration bugs, register renaming edge cases, and resolve synthesis/linting warnings.
-- **Modular Feature Branching**: Isolated high-risk microarchitectural features (such as RV32C compression and split LSQ) onto dedicated Git branches for independent simulation and FPGA resource profiling before merging into the main branch.
+We used VSCode Live Share for pair programming sessions when tracking down CDB arbitration bugs and clearing synthesis lint warnings. For experimental additions like the compressed instruction decoder and split LSQ, we developed them on isolated Git branches to test their timing and FPGA area impact before merging them into the main pipeline.
