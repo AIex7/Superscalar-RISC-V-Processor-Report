@@ -10,18 +10,6 @@ Apex-RV is a 32-bit out-of-order RISC-V processor core written in SystemVerilog 
 
 On top of the base out-of-order pipeline, we added a tournament branch predictor (GSelect plus a two-level adaptive predictor), an L1 instruction prefetcher, a post-commit store buffer with store-to-load forwarding, and split queues for memory operations. Across benchmarks (`coremark`, `aes_sha`, `compression`, `fft`, and `mergesort`), these changes roughly doubled our IPC compared to our early pipeline, while hitting 100 MHz with 1.238 ns of positive slack.
 
-## Architecture summary
-
-- Out-of-order execution with Tomasulo's algorithm, using a reorder buffer (ROB) for precise state and in-order retirement.
-- Register renaming with an architectural register file (ARF) and register alias table (RAT), removing WAR and WAW register hazards.
-- Common data bus broadcasting tags and values to reservation stations and the ROB on the same cycle execution completes.
-- Dual-stage decode, including an early decode block that pulls branch targets directly from the line buffer to keep the branch predictor ahead of the pipeline.
-- Tournament branch predictor using a 4-bit chooser between GSelect and two-level adaptive prediction, cutting branch flushes by 51.4% on CoreMark.
-- L1 cache system with a next-line prefetcher on instruction fetch and a burst memory adapter (`bmem_*`) that converts 64-bit DRAM beats into 256-bit cache lines.
-- Split load-store queue (LSQ) separating load and store stations to prevent false ordering stalls.
-- Post-commit store buffer with address coalescing and direct store-to-load forwarding.
-- Synthesized for FPGA at 100 MHz with 1.238 ns slack, achieved by restructuring reservation station arbitration into a queue rather than full matrix comparisons.
-
 ## Microarchitecture overview
 
 ### Pipeline structure
@@ -51,6 +39,18 @@ Our initial floorplan followed Tomasulo's algorithm with a speculative reorder b
 When an instruction dispatches, its source registers look up the RAT. If an older in-flight instruction produces that register, the RAT supplies the ROB tag; otherwise, the instruction takes the value from the ARF. Once operands are ready, the station issues to its functional unit. If operands are still pending, the station snoops the CDB and grabs incoming values the moment their tag appears.
 
 We also separated dispatch from functional unit availability. Instructions can dispatch into an open reservation station even when the execution unit is busy with earlier work.
+
+## Architecture summary
+
+- Out-of-order execution with Tomasulo's algorithm, using a reorder buffer (ROB) for precise state and in-order retirement.
+- Register renaming with an architectural register file (ARF) and register alias table (RAT), removing WAR and WAW register hazards.
+- Common data bus broadcasting tags and values to reservation stations and the ROB on the same cycle execution completes.
+- Dual-stage decode, including an early decode block that pulls branch targets directly from the line buffer to keep the branch predictor ahead of the pipeline.
+- Tournament branch predictor using a 4-bit chooser between GSelect and two-level adaptive prediction, cutting branch flushes by 51.4% on CoreMark.
+- L1 cache system with a next-line prefetcher on instruction fetch and a burst memory adapter (`bmem_*`) that converts 64-bit DRAM beats into 256-bit cache lines.
+- Split load-store queue (LSQ) separating load and store stations to prevent false ordering stalls.
+- Post-commit store buffer with address coalescing and direct store-to-load forwarding.
+- Synthesized for FPGA at 100 MHz with 1.238 ns slack, achieved by restructuring reservation station arbitration into a queue rather than full matrix comparisons.
 
 ## Optimizations and tuning
 
